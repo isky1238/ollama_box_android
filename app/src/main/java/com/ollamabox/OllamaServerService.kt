@@ -16,85 +16,73 @@ class OllamaServerService : Service() {
 
     private var serverProcess: Process? = null
     private var running = false
-    var isRunning: Boolean = false; private set
 
     override fun onCreate() {
         super.onCreate()
-        createNotificationChannel()
+        createChannel()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
-            ACTION_START -> startServer(intent)
-            ACTION_STOP -> stopServer()
+            ACTION_START -> handleStart(intent)
+            ACTION_STOP -> handleStop()
         }
         return START_STICKY
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
-    override fun onDestroy() {
-        stopServer()
-        super.onDestroy()
-    }
+    override fun onDestroy() { handleStop(); super.onDestroy() }
 
-    private fun createNotificationChannel() {
+    private fun createChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel(
-                CHANNEL_ID, "OllamaBox Server",
-                NotificationManager.IMPORTANCE_LOW
-            ).apply { description = "OllamaBox server status" }
-            val nm = getSystemService(NotificationManager::class.java)
-            nm.createNotificationChannel(channel)
-            Log.i(TAG, "Notification channel created")
+            val c = NotificationChannel(CHANNEL_ID, "OllamaBox",
+                NotificationManager.IMPORTANCE_DEFAULT)
+            getSystemService(NotificationManager::class.java).createNotificationChannel(c)
         }
     }
 
-    private fun startServer(intent: Intent) {
+    private fun handleStart(intent: Intent) {
         val port = intent.getIntExtra(EXTRA_PORT, 11434)
-        val modelPath = intent.getStringExtra(EXTRA_MODEL_PATH)
-        if (modelPath.isNullOrBlank()) {
-            Log.e(TAG, "No model path provided")
-            stopSelf()
-            return
+        val modelPath = intent.getStringExtra(EXTRA_MODEL_PATH) ?: run { stopSelf(); return }
+
+        try {
+            startForeground(NOTIFICATION_ID, buildNotification(port))
+        } catch (e: Exception) {
+            Log.e(TAG, "startForeground failed", e)
+            // Try without channel-specific features
+            try { startForeground(NOTIFICATION_ID, buildNotification(port)) } catch (_: Exception) {}
+            stopSelf(); return
         }
 
-        val notification = buildNotification(port)
-        startForeground(NOTIFICATION_ID, notification)
-        isRunning = true
-
-        // Use Thread instead of coroutines to avoid dependency issues
-        Thread {
-            launchServer(modelPath, port)
-        }.start()
+        Thread { runServer(modelPath, port) }.start()
     }
 
-    private fun stopServer() {
+    private fun handleStop() {
         running = false
         try { serverProcess?.destroyForcibly() } catch (_: Exception) {}
         serverProcess = null
-        isRunning = false
         try { stopForeground(STOP_FOREGROUND_REMOVE) } catch (_: Exception) {}
         stopSelf()
     }
 
-    private fun launchServer(modelPath: String, port: Int) {
+    private fun runServer(modelPath: String, port: Int) {
         try {
             val binDir = File(filesDir, "bin").also { it.mkdirs() }
-            val serverBin = File(binDir, "llama-server")
-
-            if (!serverBin.exists()) {
+            val bin = File(binDir, "llama-server")
+            if (!bin.exists()) {
                 assets.open("llama-server").use { i ->
-                    FileOutputStream(serverBin).use { o -> i.copyTo(o) }
+                    FileOutputStream(bin).use { o -> i.copyTo(o) }
                 }
-                serverBin.setExecutable(true)
-                Log.i(TAG, "Extracted llama-server")
+                bin.setExecutable(true)
             }
 
-            val libDir = applicationInfo.nativeLibraryDir
+            val env = mutableMapOf<String, String>(
+                "LD_LIBRARY_PATH" to applicationInfo.nativeLibraryDir
+            )
 
-            val cmd = listOf(
-                serverBin.absolutePath,
+            val cmd = arrayOf(
+                bin.absolutePath,
                 "--model", modelPath,
                 "--host", "127.0.0.1",
                 "--port", port.toString(),
@@ -102,61 +90,47 @@ class OllamaServerService : Service() {
                 "--cont-batching",
                 "--log-disable"
             )
-            val pb = ProcessBuilder(cmd)
-            pb.environment().apply {
-                put("LD_LIBRARY_PATH", libDir)
-                remove("LD_PRELOAD")
-            }
-            pb.directory(binDir)
-            pb.redirectErrorStream(true)
 
-            Log.i(TAG, "Starting: ${cmd.joinToString(" ")}")
-            Log.i(TAG, "LD_LIBRARY_PATH=$libDir")
-
-            serverProcess = pb.start()
+            logInfo("Starting: ${cmd.joinToString(" ")}")
+            serverProcess = Runtime.getRuntime().exec(cmd, env.map { "${it.key}=${it.value}" }.toTypedArray(), binDir)
             running = true
 
-            serverProcess!!.inputStream.bufferedReader().use { reader ->
-                var line: String?
-                while (reader.readLine().also { line = it } != null && running) {
-                    Log.d(TAG, "llama-server: $line")
-                }
+            serverProcess!!.inputStream.bufferedReader().use { r ->
+                var l: String?
+                while (r.readLine().also { l = it } != null && running)
+                    logDebug(l!!)
             }
-
-            val exitCode = serverProcess!!.waitFor()
-            Log.i(TAG, "llama-server exited: $exitCode")
+            logInfo("Exited: ${serverProcess!!.waitFor()}")
         } catch (e: Exception) {
-            Log.e(TAG, "Server error", e)
+            logError("Server error", e)
         } finally {
-            isRunning = false
-            running = false
-            try { stopForeground(STOP_FOREGROUND_REMOVE) } catch (_: Exception) {}
-            stopSelf()
+            handleStop()
         }
     }
 
-    private fun buildNotification(port: Int): Notification {
-        val pi = PendingIntent.getActivity(this, 0,
-            Intent(this, MainActivity::class.java).apply {
-                flags = Intent.FLAG_ACTIVITY_SINGLE_TOP
-            }, PendingIntent.FLAG_IMMUTABLE)
-
-        return NotificationCompat.Builder(this, CHANNEL_ID)
+    private fun buildNotification(port: Int): Notification =
+        NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("OllamaBox")
-            .setContentText("Running · localhost:$port")
-            .setSmallIcon(android.R.drawable.ic_menu_compass)
-            .setContentIntent(pi)
+            .setContentText("Running: localhost:$port")
+            .setSmallIcon(R.drawable.ic_notification)
+            .setContentIntent(PendingIntent.getActivity(this, 0,
+                Intent(this, MainActivity::class.java).apply {
+                    flags = Intent.FLAG_ACTIVITY_SINGLE_TOP
+                }, PendingIntent.FLAG_IMMUTABLE))
             .setOngoing(true)
             .build()
-    }
+
+    private fun logInfo(m: String) = Log.i(TAG, m)
+    private fun logDebug(m: String) = Log.d(TAG, m)
+    private fun logError(m: String, e: Exception) = Log.e(TAG, m, e)
 
     companion object {
-        const val TAG = "OllamaServer"
+        const val TAG = "OllamaBox"
         const val ACTION_START = "com.ollamabox.START"
         const val ACTION_STOP = "com.ollamabox.STOP"
         const val EXTRA_PORT = "port"
         const val EXTRA_MODEL_PATH = "model_path"
-        const val CHANNEL_ID = "ollama_box_server"
-        const val NOTIFICATION_ID = 1001
+        const val CHANNEL_ID = "ollamabox_channel"
+        const val NOTIFICATION_ID = 1
     }
 }
