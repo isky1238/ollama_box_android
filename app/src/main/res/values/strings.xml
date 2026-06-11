@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">OllamaBox</string>
+    <string name="start_server">启动服务</string>
+    <string name="stop_server">停止服务</string>
+    <string name="import_model">导入模型</string>
+    <string name="server_stopped">服务已停止</string>
+    <string name="status_ready">就绪</string>
+</resources>

@@ -1,0 +1,36 @@
+# Gradle
+.gradle/
+build/
+app/build/
+local.properties
+
+# IDE
+.idea/
+*.iml
+.DS_Store
+
+# Native build artifacts
+native/build*/
+native/*.tar.gz
+native/ubuntu-bin/
+native/android-libs/
+
+# Model files (too large for git)
+*.gguf
+
+# Temp
+/tmp/
+*.log
+
+# OS
+Thumbs.db
+
+# Unrelated projects
+/gpt-sovits/
+/oppo-adb-tcp/
+
+# Native prebuilt artifacts (source is in app/jniLibs)
+/native/android-libs/
+/native/llama-b9596/
+/native/ubuntu-bin/
+/native/llama-*.tar.gz
