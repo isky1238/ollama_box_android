@@ -1,20 +1,16 @@
 package com.ollamabox
 
-import android.Manifest
 import android.content.Intent
-import android.content.pm.PackageManager
 import android.net.Uri
-import android.os.Build
 import android.os.Bundle
+import android.os.Environment
 import android.provider.OpenableColumns
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
-import androidx.core.content.ContextCompat
 import com.google.android.material.snackbar.Snackbar
 import com.ollamabox.databinding.ActivityMainBinding
-import java.io.File
-import java.io.FileOutputStream
+import java.io.*
 import java.text.SimpleDateFormat
 import java.util.*
 
@@ -22,14 +18,10 @@ class MainActivity : AppCompatActivity() {
 
     private lateinit var binding: ActivityMainBinding
     private var modelPath: String? = null
+    private lateinit var logFile: File
 
     private val pickModel = registerForActivityResult(ActivityResultContracts.GetContent()) { uri ->
         uri?.let { copyModel(it) }
-    }
-
-    private val notifPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
-        if (granted) log("通知权限已授予")
-        else log("通知权限被拒绝，服务启动后可能崩溃")
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -37,8 +29,9 @@ class MainActivity : AppCompatActivity() {
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
 
-        // Request notification permission on Android 13+
-        requestNotifPermission()
+        logFile = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "ollamabox_debug.log")
+        logFile.appendText("=== OllamaBox Debug Log ===\n")
+        log("Log file: ${logFile.absolutePath}")
 
         binding.btnImportModel.setOnClickListener { pickModel.launch("application/octet-stream") }
         binding.btnStartServer.setOnClickListener {
@@ -49,16 +42,7 @@ class MainActivity : AppCompatActivity() {
             startServer(path)
         }
         binding.btnStopServer.setOnClickListener { stopServer() }
-        log("OllamaBox ready")
-    }
-
-    private fun requestNotifPermission() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
-                != PackageManager.PERMISSION_GRANTED) {
-                notifPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
-            }
-        }
+        log("OllamaBox ready (JNI mode)")
     }
 
     private fun copyModel(uri: Uri) {
@@ -70,11 +54,10 @@ class MainActivity : AppCompatActivity() {
             }
             modelPath = dest.absolutePath
             binding.tvModelName.text = name
-            log("模型导入: $name")
+            log("模型导入: $name (${dest.length()} bytes)")
             Toast.makeText(this, "已导入: $name", Toast.LENGTH_SHORT).show()
         } catch (e: Exception) {
             log("导入失败: ${e.message}")
-            Snackbar.make(binding.root, "导入失败: ${e.message}", Snackbar.LENGTH_LONG).show()
         }
     }
 
@@ -88,31 +71,112 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun startServer(path: String) {
-        startForegroundService(Intent(this, OllamaServerService::class.java).apply {
-            action = OllamaServerService.ACTION_START
-            putExtra(OllamaServerService.EXTRA_PORT, 11434)
-            putExtra(OllamaServerService.EXTRA_MODEL_PATH, path)
-        })
         binding.btnStartServer.isEnabled = false
         binding.btnStopServer.isEnabled = true
-        binding.tvServerStatus.text = "服务启动中…"
-        binding.tvApiEndpoint.text = "http://localhost:11434"
-        log("启动: localhost:11434")
+        binding.tvServerStatus.text = "正在启动..."
+        log("=== 启动服务 (JNI) ===")
+        log("模型: $path")
+
+        Thread {
+            try {
+                log("调用 ServerBridge.nativeStartServer...")
+                val startTime = System.currentTimeMillis()
+
+                // Spawn a watcher thread to update UI when server is ready
+                val watcher = Thread {
+                    try {
+                        for (i in 1..60) {
+                            Thread.sleep(500)
+                            try {
+                                val url = java.net.URL("http://127.0.0.1:11434/health")
+                                val conn = url.openConnection() as java.net.HttpURLConnection
+                                conn.connectTimeout = 1000
+                                conn.readTimeout = 1000
+                                val code = conn.responseCode
+                                val body = conn.inputStream.bufferedReader().readText()
+                                conn.disconnect()
+                                if (code == 200 && body.contains("\"status\":\"ok\"")) {
+                                    runOnUiThread {
+                                        binding.tvServerStatus.text = "服务运行中"
+                                        binding.tvApiEndpoint.text = "http://127.0.0.1:11434"
+                                    }
+                                    log("服务器已就绪！")
+                                    return@Thread
+                                } else if (code == 503) {
+                                    log("  等待模型加载... ($i)")
+                                }
+                            } catch (_: Exception) {
+                                // server not listening yet
+                            }
+                        }
+                    } catch (_: Exception) {}
+                }
+                watcher.isDaemon = true
+                watcher.start()
+
+                val exitCode = ServerBridge.nativeStartServer(
+                    modelPath = path,
+                    host = "127.0.0.1",
+                    port = 11434,
+                    ctxSize = 512,
+                    nativeLibDir = applicationInfo.nativeLibraryDir
+                )
+                val elapsed = (System.currentTimeMillis() - startTime) / 1000
+                log("服务器退出: code=$exitCode, 运行了 ${elapsed}s")
+
+                // Try to read stderr captured by JNI bridge
+                try {
+                    val stderrFile = File(filesDir, "stderr.log")
+                    if (stderrFile.exists() && stderrFile.length() > 0) {
+                        log("--- 服务器 stderr ---")
+                        stderrFile.readLines().take(50).forEach { line ->
+                            log("  E: $line")
+                        }
+                        log("--- stderr 结束 ---")
+                    }
+                } catch (_: Exception) {}
+
+            } catch (e: UnsatisfiedLinkError) {
+                log("JNI 链接失败: ${e.message}")
+                log("请确认 libjnibridge.so 已打包到 APK")
+            } catch (e: Exception) {
+                log("CRASH: ${e.javaClass.name}: ${e.message}")
+                try {
+                    val sw = StringWriter()
+                    e.printStackTrace(PrintWriter(sw))
+                    log("STACK: ${sw.toString().take(1000)}")
+                } catch (_: Exception) {}
+            } finally {
+                runOnUiThread {
+                    binding.tvServerStatus.text = "服务已停止"
+                    binding.btnStartServer.isEnabled = true
+                    binding.btnStopServer.isEnabled = false
+                }
+            }
+        }.start()
     }
 
     private fun stopServer() {
-        stopService(Intent(this, OllamaServerService::class.java))
+        log("手动停止: JNI 调用不可中断(需重启app)")
         binding.btnStartServer.isEnabled = true
         binding.btnStopServer.isEnabled = false
-        binding.tvServerStatus.text = getString(R.string.server_stopped)
-        binding.tvApiEndpoint.text = ""
-        log("服务已停止")
+        binding.tvServerStatus.text = "服务需重启APP"
     }
 
     private fun log(msg: String) {
-        val ts = SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date())
-        val cur = binding.tvLog.text
-        binding.tvLog.text = if (cur.isEmpty()) "[$ts] $msg" else "$cur\n[$ts] $msg"
-        binding.tvLog.post { binding.tvLog.scrollTo(0, binding.tvLog.bottom) }
+        val ts = SimpleDateFormat("HH:mm:ss.SSS", Locale.US).format(Date())
+        val line = "[$ts] $msg"
+        try { logFile.appendText("$line\n") } catch (_: Exception) {}
+        runOnUiThread {
+            val cur = binding.tvLog.text
+            binding.tvLog.text = if (cur.isEmpty()) line else "$cur\n$line"
+            binding.tvLog.post { binding.tvLog.scrollTo(0, binding.tvLog.bottom) }
+        }
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        // Note: llama_server blocks the thread; Android will kill the
+        // process eventually. This is okay for a local server.
     }
 }

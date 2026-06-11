@@ -20,6 +20,8 @@ native/android-libs/
 
 # Temp
 /tmp/
+# CMake build artifacts
+app/.cxx/
 *.log
 
 # OS
@@ -34,3 +36,5 @@ Thumbs.db
 /native/llama-b9596/
 /native/ubuntu-bin/
 /native/llama-*.tar.gz
+ollamabox-v1.0.0.apk
+*.apk
