@@ -96,8 +96,20 @@ curl http://127.0.0.1:11434/v1/chat/completions \
 
 ## Known Issues
 
-### Thread deadlock on some SoCs
-On MediaTek Dimensity 9300+ (and possibly other ARM SoCs), `llama.cpp`'s default auto-detected thread count (8) can cause a thread pool deadlock. **Workaround**: Set `--threads 2` in `jnibridge.c` (already configured).
+### Thread pool deadlock on Dimensity 9300/9400 (Fixed in v1.0.2)
+MediaTek's Dimensity 9300+ and 9400 use an all-big-core design (no efficiency cores).
+v1.0.0 shipped with stock ggml threading that deadlocked at >2 threads due to:
+- `memory_order_seq_cst` barrier (full DMB ISH on ARMv9)
+- Aggressive spin-wait with `yield` (ineffective on X925)
+- Pseudo-NUMA misdetection pinning to 4 of 8 cores
+
+**Fix (v1.0.2)**: Custom ggml-cpu patches — `acq_rel` barrier + `isb`/`WFE` spin-wait
++ NUMA distance validation. Speed improved **76%** (2.76→4.87 tok/s).
+
+### Chat template required for Instruct models
+Models like Qwen2.5/OpenThinker need proper chat templates (`<|im_start|>user...`).
+Raw prompts produce low-quality output. Use Chatbox or a client that sends properly
+formatted requests.
 
 ### Memory pressure
 Android may kill the app under heavy memory load. Close background apps before running large models. 1.5B Q6_K needs ~1.3GB RSS.

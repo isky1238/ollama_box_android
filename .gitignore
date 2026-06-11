@@ -38,3 +38,4 @@ Thumbs.db
 /native/llama-*.tar.gz
 ollamabox-v1.0.0.apk
 *.apk
+app/src/main/jniLibs/arm64-v8a/backup/
