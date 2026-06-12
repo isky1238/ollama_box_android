@@ -11,13 +11,23 @@ JNIEXPORT jint JNICALL
 Java_com_ollamabox_ServerBridge_nativeStartServer(
     JNIEnv* env, jobject thiz,
     jstring modelPath, jstring host, jint port, jint ctxSize,
-    jstring nativeLibDir) {
+    jint threadCount, jstring nativeLibDir) {
 
     const char* cLibDir = (*env)->GetStringUTFChars(env, nativeLibDir, NULL);
+    const char* cmodel = NULL;
+    const char* chost  = NULL;
+    jint ret = 0;
+    FILE* errf = NULL;
+    char port_str[16], ctx_str[16], thread_str[16];
+
+    /* ── Build reusable string buffers early (safe on all paths) ── */
+    snprintf(port_str, sizeof(port_str), "%d", (int)port);
+    snprintf(ctx_str,  sizeof(ctx_str),  "%d", (int)ctxSize);
+    snprintf(thread_str, sizeof(thread_str), "%d", (int)threadCount);
 
     /* ── Redirect stderr first ── */
     const char* errpath = "/data/user/0/com.ollamabox/files/stderr.log";
-    FILE* errf = freopen(errpath, "w", stderr);
+    errf = freopen(errpath, "w", stderr);
     fprintf(stderr, "=== JNI bridge ===\nlib dir: %s\n", cLibDir);
     fflush(stderr);
 
@@ -70,8 +80,8 @@ Java_com_ollamabox_ServerBridge_nativeStartServer(
         }
     } else {
         fprintf(stderr, "FATAL: ggml_backend_load not available\n");
-        fclose(errf);
-        return -1;
+        ret = -1;
+        goto cleanup;
     }
     fflush(stderr);
 
@@ -80,8 +90,8 @@ Java_com_ollamabox_ServerBridge_nativeStartServer(
     fprintf(stderr, "dlopen(libllama-server-impl.so) = %p\n", h_srv);
     if (!h_srv) {
         fprintf(stderr, "ERROR: %s\n", dlerror());
-        fclose(errf);
-        return -2;
+        ret = -2;
+        goto cleanup;
     }
     fflush(stderr);
 
@@ -96,16 +106,13 @@ Java_com_ollamabox_ServerBridge_nativeStartServer(
 
     if (!llama_server) {
         fprintf(stderr, "FATAL: cannot find llama_server\n");
-        fclose(errf);
-        return -3;
+        ret = -3;
+        goto cleanup;
     }
 
-    /* ── Build argv and call ── */
-    const char* cmodel = (*env)->GetStringUTFChars(env, modelPath, NULL);
-    const char* chost  = (*env)->GetStringUTFChars(env, host, NULL);
-    char port_str[16], ctx_str[16];
-    snprintf(port_str, sizeof(port_str), "%d", (int)port);
-    snprintf(ctx_str,  sizeof(ctx_str),  "%d", (int)ctxSize);
+    /* ── Get model/host strings (only on success path) ── */
+    cmodel = (*env)->GetStringUTFChars(env, modelPath, NULL);
+    chost  = (*env)->GetStringUTFChars(env, host, NULL);
 
     char* argv[] = {
         (char*)"llama-server",
@@ -113,8 +120,10 @@ Java_com_ollamabox_ServerBridge_nativeStartServer(
         (char*)"--host",    (char*)chost,
         (char*)"--port",    port_str,
         (char*)"--ctx-size", ctx_str,
-        (char*)"--threads", (char*)"2",
-        (char*)"--threads-batch", (char*)"2",
+        (char*)"--threads", thread_str,
+        (char*)"--threads-batch", thread_str,
+        (char*)"--parallel", (char*)"1",
+        (char*)"--ubatch-size", (char*)"256",
         (char*)"--no-mmap",
         (char*)"--verbose",
         NULL
@@ -124,14 +133,17 @@ Java_com_ollamabox_ServerBridge_nativeStartServer(
     fprintf(stderr, "Calling llama_server(argc=%d)...\n", argc);
     fflush(stderr);
 
-    jint ret = (jint)llama_server(argc, argv);
+    ret = (jint)llama_server(argc, argv);
 
     fprintf(stderr, "llama_server returned %d\n", (int)ret);
     fflush(stderr);
-    fclose(errf);
 
-    (*env)->ReleaseStringUTFChars(env, modelPath, cmodel);
-    (*env)->ReleaseStringUTFChars(env, host,   chost);
+    /* Release model/host strings after use */
+    if (cmodel) (*env)->ReleaseStringUTFChars(env, modelPath, cmodel);
+    if (chost)  (*env)->ReleaseStringUTFChars(env, host,   chost);
+
+cleanup:
+    if (errf) fclose(errf);
     (*env)->ReleaseStringUTFChars(env, nativeLibDir, cLibDir);
     return ret;
 }

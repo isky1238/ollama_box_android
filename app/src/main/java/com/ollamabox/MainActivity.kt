@@ -1,16 +1,21 @@
 package com.ollamabox
 
+import android.content.BroadcastReceiver
+import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.net.Uri
 import android.os.Bundle
-import android.os.Environment
 import android.provider.OpenableColumns
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import com.google.android.material.snackbar.Snackbar
 import com.ollamabox.databinding.ActivityMainBinding
-import java.io.*
+import java.io.File
+import java.io.FileOutputStream
+import java.io.PrintWriter
+import java.io.StringWriter
 import java.text.SimpleDateFormat
 import java.util.*
 
@@ -18,31 +23,68 @@ class MainActivity : AppCompatActivity() {
 
     private lateinit var binding: ActivityMainBinding
     private var modelPath: String? = null
+    private var modelName: String = ""
     private lateinit var logFile: File
 
     private val pickModel = registerForActivityResult(ActivityResultContracts.GetContent()) { uri ->
         uri?.let { copyModel(it) }
     }
 
-    override fun onCreate(savedInstanceState: Bundle?) {
-        super.onCreate(savedInstanceState)
-        binding = ActivityMainBinding.inflate(layoutInflater)
-        setContentView(binding.root)
-
-        logFile = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "ollamabox_debug.log")
-        logFile.appendText("=== OllamaBox Debug Log ===\n")
-        log("Log file: ${logFile.absolutePath}")
-
-        binding.btnImportModel.setOnClickListener { pickModel.launch("application/octet-stream") }
-        binding.btnStartServer.setOnClickListener {
-            val path = modelPath ?: run {
-                Snackbar.make(binding.root, "请先导入模型", Snackbar.LENGTH_SHORT).show()
-                return@setOnClickListener
-            }
-            startServer(path)
+    private val serverStartedReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            updateServerUI()
         }
-        binding.btnStopServer.setOnClickListener { stopServer() }
-        log("OllamaBox ready (JNI mode)")
+    }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        // ── Crash handler ─────────────────────────────────────────
+        val crashLog = File(filesDir, "crash.log")
+        val prevHandler = Thread.getDefaultUncaughtExceptionHandler()
+        Thread.setDefaultUncaughtExceptionHandler { t, e ->
+            try {
+                crashLog.appendText("CRASH ${SimpleDateFormat("HH:mm:ss.SSS", Locale.US).format(Date())}: ${e.javaClass.name}: ${e.message}\n")
+                val sw = StringWriter()
+                e.printStackTrace(PrintWriter(sw))
+                crashLog.appendText("$sw\n")
+            } catch (_: Exception) {}
+            prevHandler?.uncaughtException(t, e)
+        }
+
+        super.onCreate(savedInstanceState)
+        try {
+            binding = ActivityMainBinding.inflate(layoutInflater)
+            setContentView(binding.root)
+
+            logFile = File(filesDir, "debug.log")
+            logFile.appendText("=== OllamaBox v2.2.0 ===\n")
+            log("Log: ${logFile.absolutePath}")
+
+            binding.btnImportModel.setOnClickListener { pickModel.launch("application/octet-stream") }
+            binding.btnStartServer.setOnClickListener { startServer() }
+            binding.btnStopServer.setOnClickListener { stopServer() }
+
+            // Listen for server start/stop from the foreground service
+            registerReceiver(serverStartedReceiver,
+                IntentFilter("com.ollamabox.SERVER_STARTED"),
+                Context.RECEIVER_NOT_EXPORTED)
+
+            // Restore UI if service is already running
+            updateServerUI()
+
+            log("OllamaBox ready — 导入模型后点击启动")
+        } catch (e: Exception) {
+            try {
+                crashLog.appendText("onCreate CRASH: ${e.javaClass.name}: ${e.message}\n")
+                val sw = StringWriter(); e.printStackTrace(PrintWriter(sw))
+                crashLog.appendText("$sw\n")
+            } catch (_: Exception) {}
+            throw RuntimeException("onCreate failed", e)
+        }
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        try { unregisterReceiver(serverStartedReceiver) } catch (_: Exception) {}
     }
 
     private fun copyModel(uri: Uri) {
@@ -53,11 +95,13 @@ class MainActivity : AppCompatActivity() {
                 FileOutputStream(dest).use { o -> i.copyTo(o) }
             }
             modelPath = dest.absolutePath
+            modelName = name
             binding.tvModelName.text = name
             log("模型导入: $name (${dest.length()} bytes)")
             Toast.makeText(this, "已导入: $name", Toast.LENGTH_SHORT).show()
         } catch (e: Exception) {
             log("导入失败: ${e.message}")
+            Toast.makeText(this, "导入失败: ${e.message}", Toast.LENGTH_SHORT).show()
         }
     }
 
@@ -70,113 +114,83 @@ class MainActivity : AppCompatActivity() {
         return name ?: uri.lastPathSegment
     }
 
-    private fun startServer(path: String) {
+    // ═══════════════════════════════════════════════════════════════
+    //  Server — delegates to foreground service
+    // ═══════════════════════════════════════════════════════════════
+
+    private fun startServer() {
+        val path = modelPath
+        if (path == null) {
+            Snackbar.make(binding.root, "请先导入模型文件 (.gguf)", Snackbar.LENGTH_SHORT).show()
+            return
+        }
+        val svc = ServerService.instance
+        if (svc?.serverRunning == true) {
+            Snackbar.make(binding.root, "服务已在运行中", Snackbar.LENGTH_SHORT).show()
+            return
+        }
+
         binding.btnStartServer.isEnabled = false
         binding.btnStopServer.isEnabled = true
-        binding.tvServerStatus.text = "正在启动..."
-        log("=== 启动服务 (JNI) ===")
-        log("模型: $path")
+        binding.tvServerStatus.text = "正在启动前台服务..."
 
-        Thread {
-            try {
-                log("调用 ServerBridge.nativeStartServer...")
-                val startTime = System.currentTimeMillis()
+        val ctxSize = binding.etCtxSize.text.toString().toIntOrNull() ?: 2048
+        val threads = binding.etThreads.text.toString().toIntOrNull()
+            ?: Runtime.getRuntime().availableProcessors()
 
-                // Spawn a watcher thread to update UI when server is ready
-                val watcher = Thread {
-                    try {
-                        for (i in 1..60) {
-                            Thread.sleep(500)
-                            try {
-                                val url = java.net.URL("http://127.0.0.1:11434/health")
-                                val conn = url.openConnection() as java.net.HttpURLConnection
-                                conn.connectTimeout = 1000
-                                conn.readTimeout = 1000
-                                val code = conn.responseCode
-                                val body = conn.inputStream.bufferedReader().readText()
-                                conn.disconnect()
-                                if (code == 200 && body.contains("\"status\":\"ok\"")) {
-                                    runOnUiThread {
-                                        binding.tvServerStatus.text = "服务运行中"
-                                        binding.tvApiEndpoint.text = "http://127.0.0.1:11434"
-                                    }
-                                    log("服务器已就绪！")
-                                    return@Thread
-                                } else if (code == 503) {
-                                    log("  等待模型加载... ($i)")
-                                }
-                            } catch (_: Exception) {
-                                // server not listening yet
-                            }
-                        }
-                    } catch (_: Exception) {}
-                }
-                watcher.isDaemon = true
-                watcher.start()
-
-                val exitCode = ServerBridge.nativeStartServer(
-                    modelPath = path,
-                    host = "127.0.0.1",
-                    port = 11434,
-                    ctxSize = 512,
-                    nativeLibDir = applicationInfo.nativeLibraryDir
-                )
-                val elapsed = (System.currentTimeMillis() - startTime) / 1000
-                log("服务器退出: code=$exitCode, 运行了 ${elapsed}s")
-
-                // Try to read stderr captured by JNI bridge
-                try {
-                    val stderrFile = File(filesDir, "stderr.log")
-                    if (stderrFile.exists() && stderrFile.length() > 0) {
-                        log("--- 服务器 stderr ---")
-                        stderrFile.readLines().take(50).forEach { line ->
-                            log("  E: $line")
-                        }
-                        log("--- stderr 结束 ---")
-                    }
-                } catch (_: Exception) {}
-
-            } catch (e: UnsatisfiedLinkError) {
-                log("JNI 链接失败: ${e.message}")
-                log("请确认 libjnibridge.so 已打包到 APK")
-            } catch (e: Exception) {
-                log("CRASH: ${e.javaClass.name}: ${e.message}")
-                try {
-                    val sw = StringWriter()
-                    e.printStackTrace(PrintWriter(sw))
-                    log("STACK: ${sw.toString().take(1000)}")
-                } catch (_: Exception) {}
-            } finally {
-                runOnUiThread {
-                    binding.tvServerStatus.text = "服务已停止"
-                    binding.btnStartServer.isEnabled = true
-                    binding.btnStopServer.isEnabled = false
-                }
-            }
-        }.start()
+        val intent = Intent(this, ServerService::class.java).apply {
+            action = ServerService.ACTION_START
+            putExtra(ServerService.EXTRA_MODEL_PATH, path)
+            putExtra(ServerService.EXTRA_MODEL_NAME, modelName)
+            putExtra(ServerService.EXTRA_CTX_SIZE, ctxSize)
+            putExtra(ServerService.EXTRA_THREADS, threads)
+        }
+        startForegroundService(intent)
+        log("══════ 启动前台服务 ══════")
+        log("模型: $modelName")
     }
 
     private fun stopServer() {
-        log("手动停止: JNI 调用不可中断(需重启app)")
-        binding.btnStartServer.isEnabled = true
+        log("══════ 停止服务 ══════")
+        val intent = Intent(this, ServerService::class.java).apply {
+            action = ServerService.ACTION_STOP
+        }
+        startService(intent) // Service handles its own stop
+        binding.tvServerStatus.text = "释放资源中..."
+        binding.btnStartServer.isEnabled = false
         binding.btnStopServer.isEnabled = false
-        binding.tvServerStatus.text = "服务需重启APP"
+        Snackbar.make(binding.root, "正在终止进程以释放模型内存…", Snackbar.LENGTH_SHORT).show()
+    }
+
+    /** Refresh UI based on service state. Called by broadcast receiver. */
+    private fun updateServerUI() {
+        val svc = ServerService.instance
+        if (svc?.serverRunning == true) {
+            binding.tvServerStatus.text = "● 服务运行中"
+            binding.tvApiEndpoint.text = "http://127.0.0.1:11434"
+            binding.btnStartServer.isEnabled = false
+            binding.btnStopServer.isEnabled = true
+        } else if (svc != null) {
+            binding.tvServerStatus.text = "正在加载模型..."
+            binding.btnStartServer.isEnabled = false
+            binding.btnStopServer.isEnabled = true
+        } else {
+            binding.tvServerStatus.text = "服务未启动"
+            binding.btnStartServer.isEnabled = true
+            binding.btnStopServer.isEnabled = false
+        }
     }
 
     private fun log(msg: String) {
         val ts = SimpleDateFormat("HH:mm:ss.SSS", Locale.US).format(Date())
         val line = "[$ts] $msg"
         try { logFile.appendText("$line\n") } catch (_: Exception) {}
+        // Also try writing to /data/local/tmp so Termux can read without Shizuku
+        try { java.io.File("/data/local/tmp/ollamabox_startup.txt").appendText("$line\n") } catch (_: Exception) {}
         runOnUiThread {
             val cur = binding.tvLog.text
             binding.tvLog.text = if (cur.isEmpty()) line else "$cur\n$line"
             binding.tvLog.post { binding.tvLog.scrollTo(0, binding.tvLog.bottom) }
         }
-    }
-
-    override fun onDestroy() {
-        super.onDestroy()
-        // Note: llama_server blocks the thread; Android will kill the
-        // process eventually. This is okay for a local server.
     }
 }

@@ -10,6 +10,7 @@ object ServerBridge {
         host: String,
         port: Int,
         ctxSize: Int,
+        threadCount: Int,
         nativeLibDir: String
     ): Int
 }
