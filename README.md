@@ -1,6 +1,6 @@
 # OllamaBox
 
-[![Release](https://img.shields.io/badge/release-v1.1.2-blue)](https://github.com/isky1238/ollama_box_android/releases)
+[![Release](https://img.shields.io/badge/release-v1.1.1-blue)](https://github.com/isky1238/ollama_box_android/releases)
 [![Platform](https://img.shields.io/badge/platform-Android%208.0%2B-green)](https://developer.android.com)
 [![Arch](https://img.shields.io/badge/arch-arm64--v8a-orange)]()
 
@@ -75,7 +75,7 @@ The Kotlin HTTP server on `:11434` proxies to llama.cpp's internal server on `:1
 
 ## Changelog
 
-### v1.1.2
+### v1.1.1
 
 - **mmap model loading** — models load in ~3s instead of 30-80s
 - **Health-aware startup** — reports RUNNING only after model is fully loaded
