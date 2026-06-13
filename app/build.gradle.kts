@@ -11,8 +11,8 @@ android {
         applicationId = "com.ollamabox"
         minSdk = 26
         targetSdk = 35
-        versionCode = 8
-        versionName = "1.1.0"
+        versionCode = 11
+        versionName = "2.0.0"
         ndk { abiFilters += "arm64-v8a" }
     }
 
@@ -41,4 +41,5 @@ dependencies {
     implementation("androidx.appcompat:appcompat:1.7.0")
     implementation("com.google.android.material:material:1.12.0")
     implementation("androidx.constraintlayout:constraintlayout:2.2.1")
+    testImplementation("junit:junit:4.13.2")
 }

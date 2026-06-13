@@ -11,6 +11,12 @@ object ServerBridge {
         port: Int,
         ctxSize: Int,
         threadCount: Int,
-        nativeLibDir: String
+        nativeLibDir: String,
+        stderrPath: String,
+        chatTemplateKwargs: String,
+        timeoutSec: Int,
+        useMmap: Boolean
     ): Int
+
+    external fun nativeStopServer(): Boolean
 }

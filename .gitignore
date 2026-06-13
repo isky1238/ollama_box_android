@@ -40,3 +40,4 @@ ollamabox-v1.0.0.apk
 *.apk
 app/src/main/jniLibs/arm64-v8a/backup/
 app/src/main/cpp/*.so
+native/llama.cpp/build-android/

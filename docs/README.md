@@ -127,7 +127,7 @@ research/
 │       ├── java/com/ollamabox/
 │       │   ├── MainActivity.kt      # UI + server management
 │       │   ├── ServerBridge.kt      # JNI loader
-│       │   └── OllamaServerService.kt  # (unused, kept for reference)
+│       │   └── ServerService.kt        # foreground service + state machine
 │       ├── jniLibs/arm64-v8a/       # Prebuilt .so files
 │       │   ├── libjnibridge.so      # Our JNI bridge
 │       │   ├── libllama-server-impl.so

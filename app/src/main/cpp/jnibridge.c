@@ -11,24 +11,36 @@ JNIEXPORT jint JNICALL
 Java_com_ollamabox_ServerBridge_nativeStartServer(
     JNIEnv* env, jobject thiz,
     jstring modelPath, jstring host, jint port, jint ctxSize,
-    jint threadCount, jstring nativeLibDir) {
+    jint threadCount, jstring nativeLibDir,
+    jstring stderrPath, jstring chatTemplateKwargs, jint timeoutSec,
+    jboolean useMmap) {
 
-    const char* cLibDir = (*env)->GetStringUTFChars(env, nativeLibDir, NULL);
+    const char* cLibDir = NULL;
+    const char* cErrPath = NULL;
     const char* cmodel = NULL;
     const char* chost  = NULL;
+    const char* cChatKwargs = NULL;
     jint ret = 0;
     FILE* errf = NULL;
-    char port_str[16], ctx_str[16], thread_str[16];
+    char port_str[16], ctx_str[16], thread_str[16], timeout_str[16];
 
     /* ── Build reusable string buffers early (safe on all paths) ── */
     snprintf(port_str, sizeof(port_str), "%d", (int)port);
     snprintf(ctx_str,  sizeof(ctx_str),  "%d", (int)ctxSize);
     snprintf(thread_str, sizeof(thread_str), "%d", (int)threadCount);
+    snprintf(timeout_str, sizeof(timeout_str), "%d", (int)timeoutSec);
 
-    /* ── Redirect stderr first ── */
-    const char* errpath = "/data/user/0/com.ollamabox/files/stderr.log";
-    errf = freopen(errpath, "w", stderr);
-    fprintf(stderr, "=== JNI bridge ===\nlib dir: %s\n", cLibDir);
+    cLibDir = (*env)->GetStringUTFChars(env, nativeLibDir, NULL);
+    cErrPath = (*env)->GetStringUTFChars(env, stderrPath, NULL);
+    if (!cLibDir || !cErrPath) {
+        if (cLibDir) (*env)->ReleaseStringUTFChars(env, nativeLibDir, cLibDir);
+        return -5;
+    }
+
+    errf = freopen(cErrPath, "w", stderr);
+    fprintf(stderr, "=== JNI bridge v2.0 ===\nlib dir: %s\n", cLibDir);
+    fprintf(stderr, "timeout=%d chat_kwargs=%s\n", (int)timeoutSec,
+        chatTemplateKwargs ? "present" : "null");
     fflush(stderr);
 
     /* ── Load all required libs with RTLD_GLOBAL ──
@@ -50,6 +62,8 @@ Java_com_ollamabox_ServerBridge_nativeStartServer(
         fprintf(stderr, "dlopen(%s) = %p\n", libs[i].soname, libs[i].handle);
         if (!libs[i].handle) {
             fprintf(stderr, "  ERROR: %s\n", dlerror());
+            ret = -2;
+            goto cleanup;
         }
     }
     fflush(stderr);
@@ -63,11 +77,14 @@ Java_com_ollamabox_ServerBridge_nativeStartServer(
     }
 
     if (backend_load) {
+        int backend_loaded = 0;
         const char* backends[] = {
             "libggml-cpu-android_armv9.2_2.so",
             "libggml-cpu-android_armv9.2_1.so",
             "libggml-cpu-android_armv9.0_1.so",
+            "libggml-cpu-android_armv8.6_2.so",
             "libggml-cpu-android_armv8.6_1.so",
+            "libggml-cpu-android_armv8.2_3.so",
             "libggml-cpu-android_armv8.2_2.so",
             "libggml-cpu-android_armv8.2_1.so",
             "libggml-cpu-android_armv8.0_1.so",
@@ -76,7 +93,15 @@ Java_com_ollamabox_ServerBridge_nativeStartServer(
         for (int i = 0; backends[i]; i++) {
             void* reg = backend_load(backends[i]);
             fprintf(stderr, "backend_load(%s) = %p\n", backends[i], reg);
-            if (reg) break;
+            if (reg) {
+                backend_loaded = 1;
+                break;
+            }
+        }
+        if (!backend_loaded) {
+            fprintf(stderr, "FATAL: no compatible CPU backend loaded\n");
+            ret = -1;
+            goto cleanup;
         }
     } else {
         fprintf(stderr, "FATAL: ggml_backend_load not available\n");
@@ -110,40 +135,92 @@ Java_com_ollamabox_ServerBridge_nativeStartServer(
         goto cleanup;
     }
 
-    /* ── Get model/host strings (only on success path) ── */
+    /* ── Get Java strings (only on success path) ── */
     cmodel = (*env)->GetStringUTFChars(env, modelPath, NULL);
     chost  = (*env)->GetStringUTFChars(env, host, NULL);
+    if (chatTemplateKwargs) {
+        cChatKwargs = (*env)->GetStringUTFChars(env, chatTemplateKwargs, NULL);
+    }
+    if (!cmodel || !chost || (chatTemplateKwargs && !cChatKwargs)) {
+        ret = -5;
+        goto release_strings;
+    }
 
-    char* argv[] = {
-        (char*)"llama-server",
-        (char*)"--model",   (char*)cmodel,
-        (char*)"--host",    (char*)chost,
-        (char*)"--port",    port_str,
-        (char*)"--ctx-size", ctx_str,
-        (char*)"--threads", thread_str,
-        (char*)"--threads-batch", thread_str,
-        (char*)"--parallel", (char*)"1",
-        (char*)"--ubatch-size", (char*)"256",
-        (char*)"--no-mmap",
-        (char*)"--verbose",
-        NULL
-    };
-    int argc = (int)(sizeof(argv) / sizeof(argv[0])) - 1;
+    /* ── Build argv: server config + timeout + chat template kwargs ── */
+    {
+        /* Dynamic argv to handle optional --chat-template-kwargs */
+        int max_argc = 32, argc = 0;
+        const char** argv = (const char**)calloc(max_argc, sizeof(char*));
+        if (!argv) { ret = -4; goto release_strings; }
 
-    fprintf(stderr, "Calling llama_server(argc=%d)...\n", argc);
-    fflush(stderr);
+        argv[argc++] = "llama-server";
+        argv[argc++] = "--model";  argv[argc++] = cmodel;
+        argv[argc++] = "--host";   argv[argc++] = chost;
+        argv[argc++] = "--port";   argv[argc++] = port_str;
+        argv[argc++] = "--ctx-size"; argv[argc++] = ctx_str;
+        argv[argc++] = "--threads";  argv[argc++] = thread_str;
+        argv[argc++] = "--threads-batch"; argv[argc++] = thread_str;
+        argv[argc++] = "--parallel";     argv[argc++] = "1";
+        argv[argc++] = "--ubatch-size";  argv[argc++] = "256";
 
-    ret = (jint)llama_server(argc, argv);
+        /* Disable mmap only when user explicitly wants preloaded RAM.
+         * mmap loads the model near-instantly; --no-mmap reads the
+         * entire GGUF into private memory which can take 30-80 s on
+         * a 1-2 GB file under memory pressure. */
+        if (!useMmap) {
+            argv[argc++] = "--no-mmap";
+        }
 
-    fprintf(stderr, "llama_server returned %d\n", (int)ret);
-    fflush(stderr);
+        /* HTTP read/write timeout used by current llama.cpp server. */
+        argv[argc++] = "--timeout";
+        argv[argc++] = timeout_str;
 
-    /* Release model/host strings after use */
+        /* Chat template kwargs: control thinking mode */
+        if (cChatKwargs && cChatKwargs[0] != '\0') {
+            argv[argc++] = "--chat-template-kwargs";
+            argv[argc++] = cChatKwargs;
+        }
+
+        argv[argc] = NULL;
+
+        fprintf(stderr, "Calling llama_server(argc=%d)...\n", argc);
+        for (int i = 0; i < argc; i++) {
+            fprintf(stderr, "  argv[%d] = %s\n", i, argv[i]);
+        }
+        fflush(stderr);
+
+        ret = (jint)llama_server(argc, (char**)argv);
+
+        fprintf(stderr, "llama_server returned %d\n", (int)ret);
+        fflush(stderr);
+
+        free(argv);
+    }
+
+release_strings:
+    /* Release model/host/chat-template strings after use */
     if (cmodel) (*env)->ReleaseStringUTFChars(env, modelPath, cmodel);
     if (chost)  (*env)->ReleaseStringUTFChars(env, host,   chost);
+    if (cChatKwargs) (*env)->ReleaseStringUTFChars(env, chatTemplateKwargs, cChatKwargs);
 
 cleanup:
-    if (errf) fclose(errf);
+    if (errf) fflush(errf);
+    (*env)->ReleaseStringUTFChars(env, stderrPath, cErrPath);
     (*env)->ReleaseStringUTFChars(env, nativeLibDir, cLibDir);
     return ret;
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_ollamabox_ServerBridge_nativeStopServer(JNIEnv* env, jobject thiz) {
+    typedef void (*shutdown_fn)(void);
+    void* h_srv = dlopen("libllama-server-impl.so", RTLD_NOW | RTLD_GLOBAL);
+    if (!h_srv) {
+        return JNI_FALSE;
+    }
+    shutdown_fn request_shutdown = (shutdown_fn)dlsym(h_srv, "ollamabox_server_request_shutdown");
+    if (!request_shutdown) {
+        return JNI_FALSE;
+    }
+    request_shutdown();
+    return JNI_TRUE;
 }

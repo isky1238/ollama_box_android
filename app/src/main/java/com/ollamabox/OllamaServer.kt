@@ -9,22 +9,29 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.TimeZone
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.ArrayBlockingQueue
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.ThreadPoolExecutor
 
 /**
- * Ollama-compatible HTTP server for Android.
+ * Ollama-compatible HTTP gateway for Android.
  *
  * Architecture:
- *   Chatbox → :11434 (this server, Ollama-native API)
+ *   Chatbox → :11434 (this gateway, Ollama-native API)
  *               → :11435 (llama.cpp HTTP server, internal inference engine)
+ *
+ * This is a PURE pass-through gateway — it translates Ollama API paths
+ * to OpenAI-compatible paths and translates response formats back.
+ * It does NOT inject or override any request parameters (max_tokens,
+ * reasoning_format, etc.). All parameters are passed through as-is.
+ * Server-level config (enable_thinking, n_ctx, threads) is set at
+ * llama.cpp startup time via JNI.
  *
  * Lifecycle:
  *   start()  — begins accepting connections (non-blocking)
  *   stop()   — closes server socket, stops accepting
  *   join()   — waits for the server thread to exit
- *
- * The llama.cpp backend is started separately via JNI and runs on an
- * internal port.  This server is a pure-Kotlin translation layer that
- * speaks Ollama API natively — no org.json, no Writer/OutputStream mixing.
  */
 class OllamaServer(
     private val backendHost: String = "127.0.0.1",
@@ -36,11 +43,10 @@ class OllamaServer(
     @Volatile var running = false
     private var serverSocket: ServerSocket? = null
     private var serverThread: Thread? = null
-
-    /** Path to debug log file for /api/log endpoint. Set from Service. */
-    var logFilePath: String? = null
-    /** Path to llama.cpp stderr log. */
-    var stderrPath: String? = null
+    private val clients = ConcurrentHashMap.newKeySet<Socket>()
+    private val executor = ThreadPoolExecutor(
+        4, 4, 0L, TimeUnit.MILLISECONDS, ArrayBlockingQueue(16)
+    )
 
     private val dateFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US).apply {
         timeZone = TimeZone.getTimeZone("UTC")
@@ -60,6 +66,12 @@ class OllamaServer(
         running = false
         try { serverSocket?.close() } catch (_: Exception) {}
         serverSocket = null
+        clients.forEach { try { it.close() } catch (_: Exception) {} }
+        clients.clear()
+        executor.shutdownNow()
+        try { executor.awaitTermination(2, TimeUnit.SECONDS) } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+        }
     }
 
     fun join(timeout: Long = 2000) {
@@ -81,7 +93,13 @@ class OllamaServer(
                 } catch (_: Exception) {
                     if (!running) break else continue
                 }
-                Thread({ handleClient(client) }, "ollama-req").start()
+                clients.add(client)
+                try {
+                    executor.execute { handleClient(client) }
+                } catch (_: Exception) {
+                    clients.remove(client)
+                    try { client.close() } catch (_: Exception) {}
+                }
             }
         } catch (e: Exception) {
             log("OllamaServer 启动失败: ${e.message}")
@@ -94,7 +112,7 @@ class OllamaServer(
     // ── HTTP utilities ──────────────────────────────────────────────
 
     /** Read a CRLF-terminated line. Returns "" on EOF. */
-    private fun readLine(input: InputStream): String {
+    private fun readLine(input: InputStream, maxBytes: Int = 8192): String {
         val sb = StringBuilder()
         while (true) {
             val b = input.read()
@@ -104,6 +122,7 @@ class OllamaServer(
                 break
             }
             sb.append(b.toChar())
+            if (sb.length > maxBytes) throw IllegalArgumentException("HTTP line too long")
         }
         return sb.toString()
     }
@@ -127,6 +146,9 @@ class OllamaServer(
             val sizeLine = readLine(input)
             val chunkSize = sizeLine.trim().toIntOrNull(16) ?: 0
             if (chunkSize == 0) break
+            if (chunkSize > MAX_BODY_BYTES || out.size() + chunkSize > MAX_BODY_BYTES) {
+                throw IllegalArgumentException("request body too large")
+            }
             out.write(readBytes(input, chunkSize))
             readLine(input) // trailing CRLF
         }
@@ -139,7 +161,7 @@ class OllamaServer(
         contentType: String = "application/json; charset=utf-8"
     ) {
         val status = when (code) {
-            200 -> "OK"; 400 -> "Bad Request"; 404 -> "Not Found"
+            200 -> "OK"; 400 -> "Bad Request"; 404 -> "Not Found"; 413 -> "Payload Too Large"
             500 -> "Internal Error"; 502 -> "Bad Gateway"; 503 -> "Unavailable"
             else -> "Error"
         }
@@ -246,37 +268,29 @@ class OllamaServer(
 
     /**
      * Send [reqBody] to the backend [path], return (statusCode, responseBody).
-     * Forces stream=false for chat requests.
+     * Pure pass-through — no parameter injection or modification.
      */
     private fun backendRequest(method: String, path: String, reqBody: ByteArray): Pair<Int, ByteArray> {
         val sock = Socket()
         try {
             sock.connect(InetSocketAddress(backendHost, backendPort), 5000)
-            sock.soTimeout = 300000 // 5 min timeout for thinking models
+            sock.soTimeout = 300000 // 5 min timeout for slow generation
             val beIn = sock.inputStream
             val beOut = sock.outputStream
-
-            // Force stream=false for chat/completions, override model name, add max_tokens
-            var bodyBytes = reqBody
-            if (path.startsWith("/v1/chat/completions") || path.startsWith("/v1/completions")) {
-                bodyBytes = forceStreamFalse(reqBody, path)
-                bodyBytes = overrideModelName(bodyBytes)
-                bodyBytes = injectMaxTokens(bodyBytes, 512)
-            }
 
             // Send request
             val header = buildString {
                 append("$method $path HTTP/1.1\r\n")
                 append("Host: $backendHost:$backendPort\r\n")
-                if (bodyBytes.isNotEmpty()) {
+                if (reqBody.isNotEmpty()) {
                     append("Content-Type: application/json\r\n")
-                    append("Content-Length: ${bodyBytes.size}\r\n")
+                    append("Content-Length: ${reqBody.size}\r\n")
                 }
                 append("Connection: close\r\n")
                 append("\r\n")
             }
             beOut.write(header.toByteArray())
-            if (bodyBytes.isNotEmpty()) beOut.write(bodyBytes)
+            if (reqBody.isNotEmpty()) beOut.write(reqBody)
             beOut.flush()
 
             // Read status line
@@ -314,57 +328,20 @@ class OllamaServer(
         }
     }
 
-    /** Replace "stream":true → "stream":false in JSON body. */
-    private fun forceStreamFalse(body: ByteArray, path: String): ByteArray {
-        if (body.isEmpty()) return body
-        val s = String(body, Charsets.UTF_8)
-        if (!s.contains("\"stream\"")) {
-            // inject "stream":false
-            val lastBrace = s.lastIndexOf('}')
-            if (lastBrace > 0) {
-                return (s.substring(0, lastBrace) + ",\"stream\":false" + s.substring(lastBrace)).toByteArray()
-            }
-        }
-        return s.replace("\"stream\":true", "\"stream\":false")
-                .replace("\"stream\": true", "\"stream\": false")
-                .toByteArray()
-    }
-
     /**
      * Override the "model" field value to match the loaded GGUF filename.
-     * llama.cpp server rejects requests whose model name doesn't match the
-     * loaded model (the filename), so we must rewrite it.
+     * This is a necessary gateway function — llama.cpp backend requires the
+     * model name in the request to match the loaded model filename.
      */
     private fun overrideModelName(body: ByteArray): ByteArray {
         if (modelName.isEmpty()) return body
         val s = String(body, Charsets.UTF_8)
-        val result = s.replace(Regex("\"model\"\\s*:\\s*\"[^\"]*\""), "\"model\":\"$modelName\"")
-        return result.toByteArray()
-    }
-
-    /** Inject max_tokens + reasoning_in_content for thinking models.
-     *  Without reasoning_in_content:true, Chatbox sees empty content. */
-    private fun injectMaxTokens(body: ByteArray, limit: Int): ByteArray {
-        val s = String(body, Charsets.UTF_8)
-        var result = s
-        if (!result.contains("\"max_tokens\"") && !result.contains("\"max_completion_tokens\"")) {
-            val lastBrace = result.lastIndexOf('}')
-            if (lastBrace > 0) {
-                result = result.substring(0, lastBrace) + ",\"max_tokens\":$limit" + result.substring(lastBrace)
-            }
-        }
-        // Force reasoning text into content so Chatbox displays it
-        if (!result.contains("\"reasoning_in_content\"")) {
-            val lastBrace = result.lastIndexOf('}')
-            if (lastBrace > 0) {
-                result = result.substring(0, lastBrace) + ",\"reasoning_in_content\":true" + result.substring(lastBrace)
-            }
-        }
-        return result.toByteArray()
+        val replacement = "\"model\":${jsonEscape(modelName)}"
+        return Regex("\"model\"\\s*:\\s*\"[^\"]*\"").replace(s) { replacement }.toByteArray()
     }
 
     /** Current time in ISO-8601 format (Ollama created_at format). */
-    private fun createdAt(): String = dateFormat.format(Date())
+    private fun createdAt(): String = synchronized(dateFormat) { dateFormat.format(Date()) }
 
     /** Stream proxy: sends raw bytes bidirectionally for SSE streaming.
      *  Writes backend response headers + body directly to client. */
@@ -377,21 +354,17 @@ class OllamaServer(
             val beOut = beSock.outputStream
             val clOut = client.outputStream
 
-            // Override model + max_tokens but KEEP stream:true
-            var bodyBytes = overrideModelName(reqBody)
-            bodyBytes = injectMaxTokens(bodyBytes, 512)
-
-            // Forward request to backend
+            // Forward request to backend — pure pass-through
             val header = buildString {
                 append("POST $path HTTP/1.1\r\n")
                 append("Host: $backendHost:$backendPort\r\n")
                 append("Content-Type: application/json\r\n")
-                append("Content-Length: ${bodyBytes.size}\r\n")
+                append("Content-Length: ${reqBody.size}\r\n")
                 append("Connection: close\r\n")
                 append("\r\n")
             }
             beOut.write(header.toByteArray())
-            beOut.write(bodyBytes)
+            beOut.write(reqBody)
             beOut.flush()
 
             // Read backend response headers and forward to client
@@ -428,6 +401,10 @@ class OllamaServer(
     // ── API handlers ────────────────────────────────────────────────
 
     private fun handleClient(client: Socket) {
+        val startedAt = System.currentTimeMillis()
+        var method = "?"
+        var rawPath = "?"
+        var status = 500
         try {
             client.soTimeout = 30000
             val input = client.inputStream
@@ -438,15 +415,17 @@ class OllamaServer(
             if (requestLine.isBlank()) { client.close(); return }
             val parts = requestLine.split(" ")
             if (parts.size < 2) { client.close(); return }
-            val method = parts[0].uppercase()
-            val rawPath = parts[1]
+            method = parts[0].uppercase()
+            rawPath = parts[1]
 
             // Read headers
             var contentLength = 0
             var isChunked = false
+            var headerCount = 0
             while (true) {
                 val line = readLine(input)
                 if (line.isEmpty()) break
+                if (++headerCount > MAX_HEADER_COUNT) throw IllegalArgumentException("too many headers")
                 val col = line.indexOf(':')
                 if (col > 0) {
                     val k = line.substring(0, col).trim().lowercase()
@@ -454,6 +433,11 @@ class OllamaServer(
                     if (k == "content-length") contentLength = v.toIntOrNull() ?: 0
                     if (k == "transfer-encoding" && v.contains("chunked")) isChunked = true
                 }
+            }
+            if (contentLength < 0 || contentLength > MAX_BODY_BYTES) {
+                status = 413
+                writeResponse(output, status, """{"error":"request body too large"}""".toByteArray())
+                return
             }
 
             // Read body
@@ -464,23 +448,31 @@ class OllamaServer(
             }
             val body = String(bodyBytes, Charsets.UTF_8)
 
-            log("API: $method $rawPath${if (body.isNotEmpty()) " body:${body.take(100)}..." else ""}")
-
             // Detect streaming OpenAI requests — proxy raw bytes
             val isStreaming = rawPath == "/v1/chat/completions" &&
                 method == "POST" &&
-                (body.contains("\"stream\":true") || body.contains("\"stream\": true"))
+                STREAM_TRUE.containsMatchIn(body)
 
             if (isStreaming) {
-                streamProxy(client, rawPath, bodyBytes)
+                status = 200
+                streamProxy(client, rawPath, overrideModelName(bodyBytes))
             } else {
                 val response = route(method, rawPath, bodyBytes, body)
+                status = response.first
                 writeResponse(output, response.first, response.second)
-                client.close()
+            }
+        } catch (e: IllegalArgumentException) {
+            status = 400
+            try {
+                writeResponse(client.outputStream, status, """{"error":${jsonEscape(e.message ?: "bad request")}}""".toByteArray())
+            } catch (_: Exception) {
             }
         } catch (e: Exception) {
             log("handle: ${e.javaClass.simpleName}: ${e.message}")
+        } finally {
+            clients.remove(client)
             try { client.close() } catch (_: Exception) {}
+            log("API: $method $rawPath status=$status durationMs=${System.currentTimeMillis() - startedAt}")
         }
     }
 
@@ -490,37 +482,29 @@ class OllamaServer(
             method == "GET" && (path == "/" || path == "") ->
                 200 to statusPage()
 
-            method == "GET" && path == "/api/stderr" -> {
-                200 to fileBytes(stderrPath)
-            }
-
-            method == "GET" && path == "/api/log" -> {
-                200 to debugLogBytes()
-            }
-
             method == "GET" && path == "/health" -> {
                 val (code, resp) = backendRequest("GET", "/health", ByteArray(0))
                 code to resp
             }
 
             method == "GET" && path == "/api/version" ->
-                200 to """{"version":"2.2.0-ollamabox"}""".toByteArray()
+                200 to """{"version":"2.0.0-ollamabox"}""".toByteArray()
 
             method == "GET" && path == "/api/tags" -> {
                 val (code, resp) = backendRequest("GET", "/v1/models", ByteArray(0))
                 code to translateTags(String(resp, Charsets.UTF_8))
             }
 
-            // Ollama-native chat: force non-stream, translate response
+            // Ollama-native chat: translate path + response format, pass body unchanged
             method == "POST" && path == "/api/chat" -> {
-                val req = overrideModelName(injectMaxTokens(forceStreamFalse(bodyBytes, "/api/chat"), 512))
+                val req = overrideModelName(bodyBytes)
                 val (code, resp) = backendRequest("POST", "/v1/chat/completions", req)
                 if (code >= 400) code to resp
                 else code to translateChat(String(resp, Charsets.UTF_8))
             }
 
-            method == "POST" && path == "/api/generate" || path == "/v1/completions" -> {
-                val req = overrideModelName(injectMaxTokens(forceStreamFalse(bodyBytes, "/v1/completions"), 512))
+            method == "POST" && (path == "/api/generate" || path == "/v1/completions") -> {
+                val req = overrideModelName(bodyBytes)
                 val (code, resp) = backendRequest("POST", "/v1/completions", req)
                 if (code >= 400) code to resp
                 else code to translateGenerate(String(resp, Charsets.UTF_8))
@@ -528,12 +512,12 @@ class OllamaServer(
 
             // OpenAI-compatible /v1/chat/completions: passthrough with model override
             method == "POST" && path == "/v1/chat/completions" -> {
-                val isStreaming = body.contains("\"stream\":true") || body.contains("\"stream\": true")
-                val req = overrideModelName(injectMaxTokens(bodyBytes, 512))
+                val isStreaming = STREAM_TRUE.containsMatchIn(body)
                 if (isStreaming) {
-                    // Stream passthrough — handled separately via handleClientStream
+                    // Stream passthrough — handled separately via streamProxy
                     200 to """{"error":"internal: use stream handler"}""".toByteArray()
                 } else {
+                    val req = overrideModelName(bodyBytes)
                     val (code, resp) = backendRequest("POST", "/v1/chat/completions", req)
                     code to resp // raw OpenAI response, no translation
                 }
@@ -551,34 +535,28 @@ class OllamaServer(
 
     // ── Status page ─────────────────────────────────────────────────
 
-    private fun fileBytes(filePath: String?): ByteArray {
-        if (filePath == null) return """{"error":"path not set"}""".toByteArray()
-        return try {
-            java.io.File(filePath).readBytes()
-        } catch (e: Exception) {
-            """{"error":"cannot read: ${e.message}"}""".toByteArray()
-        }
-    }
-
-    private fun debugLogBytes(): ByteArray = fileBytes(logFilePath)
-
     private fun statusPage(): ByteArray {
         val body = buildString {
             append("{")
-            append("\"service\":\"OllamaBox v2.2.0\",")
+            append("\"service\":\"OllamaBox v2.0.0\",")
             append("\"status\":\"running\",")
             append("\"model\":\"$modelName\",")
             append("\"endpoints\":{")
             append("\"chat\":\"POST /api/chat\",")
             append("\"tags\":\"GET /api/tags\",")
             append("\"version\":\"GET /api/version\",")
-            append("\"health\":\"GET /health\",")
-            append("\"log\":\"GET /api/log\"")
+            append("\"health\":\"GET /health\"")
             append("},")
             append("\"connect\":\"http://127.0.0.1:$listenPort\"")
             append("}")
         }
         return body.toByteArray()
+    }
+
+    companion object {
+        private const val MAX_BODY_BYTES = 4 * 1024 * 1024
+        private const val MAX_HEADER_COUNT = 100
+        private val STREAM_TRUE = Regex("\"stream\"\\s*:\\s*true")
     }
 
     // ── Response translators ────────────────────────────────────────
@@ -625,7 +603,6 @@ class OllamaServer(
             append("\"done_reason\":\"stop\"")
             append("}")
         }
-        log("  → chat: ${result.take(120)}...")
         return result.toByteArray()
     }
 
@@ -667,26 +644,23 @@ class OllamaServer(
             append("\"done_reason\":\"stop\"")
             append("}")
         }
-        log("  → generate: ${result.take(120)}...")
         return result.toByteArray()
     }
 
     /**
      * Translate OpenAI /v1/models → Ollama /api/tags.
      *
-     * OpenAI:
-     *   {"data":[{"id":"model.gguf","created":123,...},...]}
-     *
-     * Ollama:
-     *   {"models":[{"name":"model.gguf","model":"model.gguf",...},...]}
+     * llama.cpp b9596+ returns a hybrid response containing both
+     * "models" (Ollama keys with empty values) and "data" (OpenAI keys
+     * with real values). We always rebuild from the "data" array so
+     * Chatbox gets valid modified_at / size / digest fields.
      */
     private fun translateTags(backendBody: String): ByteArray {
-        // If already Ollama format, return as-is
-        if (backendBody.contains("\"models\"")) return backendBody.toByteArray()
-
         val sb = StringBuilder()
         sb.append("{\"models\":[")
 
+        // llama.cpp hybrid response has "data" alongside "models";
+        // pure OpenAI format also uses "data".  Parse that array.
         val data = jsonFind(backendBody, "data")
         if (data != null && data.startsWith("[")) {
             var s = data.substring(1).trimStart()
@@ -699,26 +673,47 @@ class OllamaServer(
                 if (s.startsWith(",")) s = s.substring(1).trimStart()
 
                 val id = jsonString(obj, "id")
-                val created = jsonString(obj, "created")
+                val createdUnix = jsonString(obj, "created")
                 val meta = jsonFind(obj, "meta")
                 val size = if (meta != null) jsonString(obj, "meta", "size") else "0"
                 val details = if (meta != null) jsonValue(meta)?.first ?: "{}" else "{}"
+
+                // Convert Unix timestamp to ISO-8601 for Ollama compatibility
+                val modifiedAt = if (createdUnix.isNotEmpty()) {
+                    try {
+                        val millis = createdUnix.toLong() * 1000L
+                        synchronized(dateFormat) { dateFormat.format(Date(millis)) }
+                    } catch (_: NumberFormatException) {
+                        ""
+                    }
+                } else ""
+
+                // Compute a stable model digest from id + size
+                val digest = if (id.isNotEmpty() && size.isNotEmpty() && size != "0") {
+                    try {
+                        val raw = "$id:$size"
+                        val md = java.security.MessageDigest.getInstance("SHA-256")
+                        val hash = md.digest(raw.toByteArray())
+                        val hex = hash.joinToString("") { "%02x".format(it) }
+                        "sha256:$hex"
+                    } catch (_: Exception) {
+                        ""
+                    }
+                } else ""
 
                 if (!first) sb.append(",")
                 first = false
                 sb.append("{")
                 sb.append("\"name\":\"$id\",")
                 sb.append("\"model\":\"$id\",")
-                sb.append("\"modified_at\":$created,")
+                sb.append("\"modified_at\":\"$modifiedAt\",")
                 sb.append("\"size\":$size,")
-                sb.append("\"digest\":\"\",")
+                sb.append("\"digest\":\"$digest\",")
                 sb.append("\"details\":$details")
                 sb.append("}")
             }
         }
         sb.append("]}")
-        val result = sb.toString()
-        log("  → tags: ${result.take(120)}...")
-        return result.toByteArray()
+        return sb.toString().toByteArray()
     }
 }
