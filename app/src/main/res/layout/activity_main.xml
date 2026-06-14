@@ -163,6 +163,45 @@
                         android:layout_height="wrap_content"
                         android:text="打开 App 自动启动（默认关闭）" />
 
+                    <!-- GPU layer offload slider -->
+                    <LinearLayout
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="8dp"
+                        android:gravity="center_vertical"
+                        android:orientation="horizontal">
+
+                        <TextView
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:text="GPU 层数:" />
+
+                        <TextView
+                            android:id="@+id/tvGpuLayersValue"
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:layout_marginStart="6dp"
+                            android:text="CPU (0)"
+                            android:textStyle="bold" />
+                    </LinearLayout>
+
+                    <com.google.android.material.slider.Slider
+                        android:id="@+id/sliderGpuLayers"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:valueFrom="0"
+                        android:valueTo="99"
+                        android:stepSize="1"
+                        android:value="0" />
+
+                    <TextView
+                        android:id="@+id/tvGpuLayersInfo"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:textSize="11sp"
+                        android:textColor="#888888"
+                        android:text="0=纯CPU | 99=全部GPU | Mali GPU推荐保持0" />
+
                     <LinearLayout
                         android:layout_width="match_parent"
                         android:layout_height="wrap_content"

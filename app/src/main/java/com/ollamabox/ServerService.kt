@@ -40,6 +40,7 @@ class ServerService : Service() {
         const val EXTRA_CTX_SIZE = "ctx_size"
         const val EXTRA_THREADS = "threads"
         const val EXTRA_ENABLE_THINKING = "enable_thinking"
+        const val EXTRA_N_GPU_LAYERS = "n_gpu_layers"
         const val EXTRA_STATE = "state"
         const val EXTRA_ERROR = "error"
 
@@ -92,7 +93,8 @@ class ServerService : Service() {
             name = intent.getStringExtra(EXTRA_MODEL_NAME) ?: File(path).name,
             ctxSize = intent.getIntExtra(EXTRA_CTX_SIZE, 8192),
             threadCount = intent.getIntExtra(EXTRA_THREADS, 2),
-            enableThinking = intent.getBooleanExtra(EXTRA_ENABLE_THINKING, false)
+            enableThinking = intent.getBooleanExtra(EXTRA_ENABLE_THINKING, false),
+            nGpuLayers = intent.getIntExtra(EXTRA_N_GPU_LAYERS, 0)
         )
     }
 
@@ -106,9 +108,10 @@ class ServerService : Service() {
         val ctx = intent.getIntExtra(EXTRA_CTX_SIZE, 8192)
         val threads = intent.getIntExtra(EXTRA_THREADS, Runtime.getRuntime().availableProcessors())
         val thinking = intent.getBooleanExtra(EXTRA_ENABLE_THINKING, false)
+        val nGpuLayers = intent.getIntExtra(EXTRA_N_GPU_LAYERS, 0)
         Thread({
             if (stopServer(stopService = false)) {
-                startServer(path, name, ctx, threads, thinking)
+                startServer(path, name, ctx, threads, thinking, nGpuLayers)
             }
         }, "server-restart").start()
     }
@@ -119,7 +122,8 @@ class ServerService : Service() {
         name: String,
         ctxSize: Int,
         threadCount: Int,
-        enableThinking: Boolean
+        enableThinking: Boolean,
+        nGpuLayers: Int = 0
     ) {
         if (state in setOf(ServerState.STARTING_NATIVE, ServerState.STARTING_GATEWAY, ServerState.RUNNING, ServerState.STOPPING)) {
             return
@@ -143,7 +147,7 @@ class ServerService : Service() {
         lastError = null
         val runId = ++lifecycleId
         setState(ServerState.STARTING_NATIVE)
-        log("启动模型: $name ctxSize=$ctxSize threads=$threadCount enableThinking=$enableThinking")
+        log("启动模型: $name ctxSize=$ctxSize threads=$threadCount enableThinking=$enableThinking nGpuLayers=$nGpuLayers")
 
         nativeThread = Thread({
             val exitCode = try {
@@ -157,7 +161,8 @@ class ServerService : Service() {
                     stderrPath = File(filesDir, "stderr.log").absolutePath,
                     chatTemplateKwargs = """{"enable_thinking":$enableThinking}""",
                     timeoutSec = 300,
-                    useMmap = true   // mmap loads near-instantly; set false for legacy --no-mmap
+                    useMmap = true,  // mmap loads near-instantly; set false for legacy --no-mmap
+                    nGpuLayers = nGpuLayers
                 )
             } catch (e: Throwable) {
                 log("JNI 启动异常: ${e.javaClass.simpleName}: ${e.message}")
@@ -175,6 +180,7 @@ class ServerService : Service() {
                         -3 -> "推理服务入口不存在"
                         -4 -> "原生内存分配失败"
                         -5 -> "JNI 参数或字符串读取失败"
+                        -6 -> "Vulkan GPU 后端加载失败"
                         else -> "推理引擎已退出"
                     }
                     fail("$reason，code=$exitCode${nativeDetail?.let { "，$it" } ?: ""}")
@@ -218,6 +224,7 @@ class ServerService : Service() {
             }
             if (runId == lifecycleId && state != ServerState.STOPPING) {
                 setState(ServerState.RUNNING)
+                logNativeGpuSummary(nGpuLayers)
                 log("服务已启动: http://127.0.0.1:11434")
             }
         }, "server-starter").start()
@@ -307,6 +314,30 @@ class ServerService : Service() {
             ?.take(240)
     } catch (_: Exception) {
         null
+    }
+
+    private fun logNativeGpuSummary(requestedGpuLayers: Int) {
+        if (requestedGpuLayers <= 0) {
+            log("GPU offload: 未启用 (nGpuLayers=0)")
+            return
+        }
+        val summary = try {
+            File(filesDir, "stderr.log")
+                .takeIf { it.isFile }
+                ?.readLines()
+                ?.filter { line ->
+                    line.contains("registered backends") ||
+                        line.contains("registered devices") ||
+                        line.contains("offloaded", ignoreCase = true) ||
+                        line.contains("Vulkan", ignoreCase = true)
+                }
+                ?.takeLast(8)
+                ?.joinToString(" | ")
+        } catch (_: Exception) {
+            null
+        }
+        log("GPU offload 请求: $requestedGpuLayers 层")
+        log("GPU 原生状态: ${summary?.takeIf { it.isNotBlank() } ?: "未找到 Vulkan/offload 证据"}")
     }
 
     private fun waitForPort(port: Int, timeoutMs: Long, runId: Long): Boolean {

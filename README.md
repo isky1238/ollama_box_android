@@ -6,9 +6,15 @@
 
 Run [llama.cpp](https://github.com/ggml-org/llama.cpp) natively on Android and expose an **Ollama + OpenAI-compatible HTTP API** on `localhost:11434`. Import your own GGUF models from storage.
 
+## Gate Build Notice
+
+This repository currently contains a **Gate/experimental Vulkan build**. The GPU layer control and Vulkan backend are packaged, but GPU scheduling is not yet fully verified across Android drivers. A request for GPU layers may execute through hardware Vulkan, a driver software path, or fall back to CPU while still appearing available. Current CPU and GPU benchmark results can be identical.
+
+Use `GPU layers = 0` for predictable operation. Treat GPU mode as diagnostic until native logs confirm a Vulkan device and `offloaded N/N layers to GPU`.
+
 ## Features
 
-- 🚀 **Native performance** — llama.cpp runs in-process via JNI
+- 🚀 **Native performance** — llama.cpp runs in-process via JNI, supports Vulkan GPU offload
 - 🔌 **Dual API** — Ollama (`/api/chat`, `/api/tags`) + OpenAI (`/v1/chat/completions`, `/v1/models`)
 - 📡 **SSE Streaming** — Real-time token streaming for OpenAI-compatible clients (Chatbox, etc.)
 - 🛡️ **Foreground Service** — Persistent notification with WakeLock; tuned for ColorOS/HyperOS background survival
@@ -17,6 +23,7 @@ Run [llama.cpp](https://github.com/ggml-org/llama.cpp) natively on Android and e
 - ⚡ **Dimensity 9300/9400 optimized** — ARM SVE + mmap model loading
 - ⏱️ **Fast model loading** — mmap loads 1-2 GB GGUF files in seconds (not minutes)
 - 🩺 **Health check** — Reports RUNNING only after model is fully loaded (prevents 503 errors)
+- 🎮 **GPU Offload** — Optional Vulkan GPU acceleration with `--n-gpu-layers` slider (0-99, default CPU)
 
 ## Quick Start
 
@@ -52,6 +59,8 @@ Run [llama.cpp](https://github.com/ggml-org/llama.cpp) natively on Android and e
 | Dimensity 9300+ | OpenThinker3-1.5B Q6_K | 2 | 8192 | **~20** | mmap |
 
 > **Note:** mmap loads models in ~3 seconds (vs 30-80s with `--no-mmap`). Hot inference after page-cache warmup is identical to preloaded mode.
+>
+> **GPU note:** Vulkan availability only confirms that the backend and system loader are present. It does not prove that model layers are executing on hardware GPU. CPU mode is the default and recommended for this Gate build.
 
 ## Architecture
 
@@ -75,6 +84,12 @@ The Kotlin HTTP server on `:11434` proxies to llama.cpp's internal server on `:1
 
 ## Changelog
 
+### Gate build
+
+- Added experimental Vulkan backend packaging and GPU-layer controls
+- Added native backend/device/offload diagnostics
+- Known issue: GPU scheduling may use hardware Vulkan, a software/driver path, or CPU fallback; current benchmarks do not prove hardware GPU execution
+
 ### v1.1.1
 
 - **mmap model loading** — models load in ~3s instead of 30-80s
@@ -91,8 +106,11 @@ The Kotlin HTTP server on `:11434` proxies to llama.cpp's internal server on `:1
 ## Building
 
 ```bash
-# Rebuild JNI bridge and llama-server implementation
+# CPU-only build (default)
 ./scripts/build-native.sh
+
+# Build with Vulkan GPU support
+BUILD_VULKAN=1 ./scripts/build-native.sh
 
 # Build APK
 ANDROID_HOME=/opt/android-sdk ./gradlew assembleDebug

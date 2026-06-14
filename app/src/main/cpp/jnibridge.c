@@ -13,7 +13,7 @@ Java_com_ollamabox_ServerBridge_nativeStartServer(
     jstring modelPath, jstring host, jint port, jint ctxSize,
     jint threadCount, jstring nativeLibDir,
     jstring stderrPath, jstring chatTemplateKwargs, jint timeoutSec,
-    jboolean useMmap) {
+    jboolean useMmap, jint nGpuLayers) {
 
     const char* cLibDir = NULL;
     const char* cErrPath = NULL;
@@ -22,13 +22,14 @@ Java_com_ollamabox_ServerBridge_nativeStartServer(
     const char* cChatKwargs = NULL;
     jint ret = 0;
     FILE* errf = NULL;
-    char port_str[16], ctx_str[16], thread_str[16], timeout_str[16];
+    char port_str[16], ctx_str[16], thread_str[16], timeout_str[16], gpu_layers_str[16];
 
     /* ── Build reusable string buffers early (safe on all paths) ── */
     snprintf(port_str, sizeof(port_str), "%d", (int)port);
     snprintf(ctx_str,  sizeof(ctx_str),  "%d", (int)ctxSize);
     snprintf(thread_str, sizeof(thread_str), "%d", (int)threadCount);
     snprintf(timeout_str, sizeof(timeout_str), "%d", (int)timeoutSec);
+    snprintf(gpu_layers_str, sizeof(gpu_layers_str), "%d", (int)nGpuLayers);
 
     cLibDir = (*env)->GetStringUTFChars(env, nativeLibDir, NULL);
     cErrPath = (*env)->GetStringUTFChars(env, stderrPath, NULL);
@@ -68,15 +69,37 @@ Java_com_ollamabox_ServerBridge_nativeStartServer(
     }
     fflush(stderr);
 
-    /* ── Load CPU backend via ggml_backend_load ── */
+    /* ── Load requested backends via ggml_backend_load ── */
     void* h_ggml = libs[1].handle; /* libggml.so */
     void* (*backend_load)(const char*) = NULL;
+    size_t (*backend_reg_count)(void) = NULL;
+    void* (*backend_reg_get)(size_t) = NULL;
+    const char* (*backend_reg_name)(void*) = NULL;
+    size_t (*backend_dev_count)(void) = NULL;
+    void* (*backend_dev_get)(size_t) = NULL;
+    const char* (*backend_dev_name)(void*) = NULL;
     if (h_ggml) {
         backend_load = (void* (*)(const char*))dlsym(h_ggml, "ggml_backend_load");
+        backend_reg_count = (size_t (*)(void))dlsym(h_ggml, "ggml_backend_reg_count");
+        backend_reg_get = (void* (*)(size_t))dlsym(h_ggml, "ggml_backend_reg_get");
+        backend_reg_name = (const char* (*)(void*))dlsym(h_ggml, "ggml_backend_reg_name");
+        backend_dev_count = (size_t (*)(void))dlsym(h_ggml, "ggml_backend_dev_count");
+        backend_dev_get = (void* (*)(size_t))dlsym(h_ggml, "ggml_backend_dev_get");
+        backend_dev_name = (const char* (*)(void*))dlsym(h_ggml, "ggml_backend_dev_name");
         fprintf(stderr, "dlsym(libggml, ggml_backend_load) = %p\n", (void*)backend_load);
     }
 
     if (backend_load) {
+        if (nGpuLayers > 0) {
+            void* vulkan_reg = backend_load("libggml-vulkan.so");
+            fprintf(stderr, "backend_load(libggml-vulkan.so) = %p\n", vulkan_reg);
+            if (!vulkan_reg) {
+                fprintf(stderr, "FATAL: Vulkan GPU backend requested but could not be loaded\n");
+                ret = -6;
+                goto cleanup;
+            }
+        }
+
         int backend_loaded = 0;
         const char* backends[] = {
             "libggml-cpu-android_armv9.2_2.so",
@@ -107,6 +130,23 @@ Java_com_ollamabox_ServerBridge_nativeStartServer(
         fprintf(stderr, "FATAL: ggml_backend_load not available\n");
         ret = -1;
         goto cleanup;
+    }
+
+    if (backend_reg_count && backend_reg_get && backend_reg_name) {
+        size_t count = backend_reg_count();
+        fprintf(stderr, "registered backends (%zu):", count);
+        for (size_t i = 0; i < count; i++) {
+            fprintf(stderr, " %s", backend_reg_name(backend_reg_get(i)));
+        }
+        fprintf(stderr, "\n");
+    }
+    if (backend_dev_count && backend_dev_get && backend_dev_name) {
+        size_t count = backend_dev_count();
+        fprintf(stderr, "registered devices (%zu):", count);
+        for (size_t i = 0; i < count; i++) {
+            fprintf(stderr, " %s", backend_dev_name(backend_dev_get(i)));
+        }
+        fprintf(stderr, "\n");
     }
     fflush(stderr);
 
@@ -162,6 +202,13 @@ Java_com_ollamabox_ServerBridge_nativeStartServer(
         argv[argc++] = "--threads-batch"; argv[argc++] = thread_str;
         argv[argc++] = "--parallel";     argv[argc++] = "1";
         argv[argc++] = "--ubatch-size";  argv[argc++] = "256";
+
+        /* GPU layer offload: 0 = CPU only, N > 0 = offload N layers to GPU.
+         * The Vulkan backend was explicitly registered above. */
+        if (nGpuLayers > 0) {
+            argv[argc++] = "--n-gpu-layers";
+            argv[argc++] = gpu_layers_str;
+        }
 
         /* Disable mmap only when user explicitly wants preloaded RAM.
          * mmap loads the model near-instantly; --no-mmap reads the

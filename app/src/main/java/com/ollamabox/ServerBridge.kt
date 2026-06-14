@@ -15,7 +15,8 @@ object ServerBridge {
         stderrPath: String,
         chatTemplateKwargs: String,
         timeoutSec: Int,
-        useMmap: Boolean
+        useMmap: Boolean,
+        nGpuLayers: Int
     ): Int
 
     external fun nativeStopServer(): Boolean

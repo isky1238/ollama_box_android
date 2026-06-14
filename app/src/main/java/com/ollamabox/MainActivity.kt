@@ -32,6 +32,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var prefs: android.content.SharedPreferences
     private var savedThreads: Int = 0
     private var savedCtxSize: Int = 8192
+    private var savedNGpuLayers: Int = 0
     private var savedEnableThinking: Boolean = false
     private var receiverRegistered = false
     private val logHandler = Handler(Looper.getMainLooper())
@@ -50,6 +51,7 @@ class MainActivity : AppCompatActivity() {
         private const val KEY_THREADS = "threads"
         private const val KEY_ENABLE_THINKING = "enableThinking"
         private const val KEY_AUTO_START = "autoStart"
+        private const val KEY_N_GPU_LAYERS = "nGpuLayers"
     }
 
     private val pickModel = registerForActivityResult(ActivityResultContracts.GetContent()) { uri ->
@@ -109,6 +111,26 @@ class MainActivity : AppCompatActivity() {
             binding.etThreads.addTextChangedListener(settingsWatcher)
             binding.swEnableThinking.setOnCheckedChangeListener { _, _ -> updateApplyButton() }
 
+            // Vulkan GPU detection: distinguish device support from APK packaging.
+            val vulkanAvailability = VulkanDetector.availability(this)
+            log("Vulkan 状态：$vulkanAvailability")
+            if (vulkanAvailability != VulkanDetector.Availability.AVAILABLE) {
+                binding.sliderGpuLayers.isEnabled = false
+                binding.tvGpuLayersValue.text = "不可用"
+                binding.tvGpuLayersInfo.text = when (vulkanAvailability) {
+                    VulkanDetector.Availability.BACKEND_NOT_PACKAGED ->
+                        "当前 APK 未包含 Vulkan GPU 后端"
+                    VulkanDetector.Availability.DEVICE_UNSUPPORTED ->
+                        "此设备不支持 GPU 加速 (Vulkan)"
+                    VulkanDetector.Availability.AVAILABLE -> ""
+                }
+            }
+            binding.sliderGpuLayers.addOnChangeListener { _, value, _ ->
+                val layers = value.toInt()
+                binding.tvGpuLayersValue.text = gpuLayersLabel(layers)
+                updateApplyButton()
+            }
+
             // Restore UI
             updateServerUI()
             updateApplyButton()
@@ -160,10 +182,13 @@ class MainActivity : AppCompatActivity() {
         savedCtxSize = prefs.getInt(KEY_CTX_SIZE, 8192)
         savedThreads = prefs.getInt(KEY_THREADS, 2)
         savedEnableThinking = prefs.getBoolean(KEY_ENABLE_THINKING, false)
+        savedNGpuLayers = prefs.getInt(KEY_N_GPU_LAYERS, 0)
         binding.etCtxSize.setText(savedCtxSize.toString())
         binding.etThreads.setText(savedThreads.toString())
         binding.swEnableThinking.isChecked = savedEnableThinking
         binding.swAutoStart.isChecked = prefs.getBoolean(KEY_AUTO_START, false)
+        binding.sliderGpuLayers.value = savedNGpuLayers.toFloat()
+        binding.tvGpuLayersValue.text = gpuLayersLabel(savedNGpuLayers)
 
         // Restore model if file still exists
         val savedPath = prefs.getString(KEY_MODEL_PATH, null)
@@ -190,9 +215,11 @@ class MainActivity : AppCompatActivity() {
         }
         savedCtxSize = binding.etCtxSize.text.toString().toIntOrNull() ?: 8192
         savedThreads = binding.etThreads.text.toString().toIntOrNull() ?: 2
+        savedNGpuLayers = binding.sliderGpuLayers.value.toInt()
         savedEnableThinking = binding.swEnableThinking.isChecked
         prefsEdit.putInt(KEY_CTX_SIZE, savedCtxSize)
         prefsEdit.putInt(KEY_THREADS, savedThreads)
+        prefsEdit.putInt(KEY_N_GPU_LAYERS, savedNGpuLayers)
         prefsEdit.putBoolean(KEY_ENABLE_THINKING, savedEnableThinking)
         prefsEdit.apply()
     }
@@ -213,6 +240,7 @@ class MainActivity : AppCompatActivity() {
                 putExtra(ServerService.EXTRA_CTX_SIZE, savedCtxSize)
                 putExtra(ServerService.EXTRA_THREADS, savedThreads)
                 putExtra(ServerService.EXTRA_ENABLE_THINKING, savedEnableThinking)
+                putExtra(ServerService.EXTRA_N_GPU_LAYERS, savedNGpuLayers)
             }
             startService(intent)
             binding.tvServerStatus.text = "正在重启服务..."
@@ -227,8 +255,10 @@ class MainActivity : AppCompatActivity() {
     private fun updateApplyButton() {
         val currentCtx = binding.etCtxSize.text.toString().toIntOrNull() ?: savedCtxSize
         val currentThreads = binding.etThreads.text.toString().toIntOrNull() ?: savedThreads
+        val currentGpuLayers = binding.sliderGpuLayers.value.toInt()
         val changed = currentCtx != savedCtxSize ||
             currentThreads != savedThreads ||
+            currentGpuLayers != savedNGpuLayers ||
             binding.swEnableThinking.isChecked != savedEnableThinking
         val svc = ServerService.instance
         binding.btnApply.isEnabled = changed && svc?.serverRunning == true
@@ -308,6 +338,7 @@ class MainActivity : AppCompatActivity() {
             putExtra(ServerService.EXTRA_CTX_SIZE, ctxSize)
             putExtra(ServerService.EXTRA_THREADS, threads)
             putExtra(ServerService.EXTRA_ENABLE_THINKING, savedEnableThinking)
+            putExtra(ServerService.EXTRA_N_GPU_LAYERS, savedNGpuLayers)
         }
         startForegroundService(intent)
         log("══════ 启动前台服务 ══════")
@@ -392,6 +423,12 @@ class MainActivity : AppCompatActivity() {
                 binding.scrollLog.post { binding.scrollLog.fullScroll(android.view.View.FOCUS_DOWN) }
             }
         }
+    }
+
+    private fun gpuLayersLabel(layers: Int): String = when {
+        layers <= 0 -> "CPU (0)"
+        layers >= 99 -> "GPU (99)"
+        else -> "$layers 层"
     }
 
     // ── Self-test ─────────────────────────────────────────────────────
